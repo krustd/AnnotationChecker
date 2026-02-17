@@ -680,6 +680,101 @@ class CorrectionCheckTab(QWidget):
         self.image_label.adjustSize()
 
 
+# ── Tab 5: 耗时统计 ──────────────────────────────────────────────────
+class TimeStatisticsTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        self.figure = Figure(figsize=(12, 4), dpi=100)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        layout.addWidget(self.canvas)
+        self.stats_label = QLabel()
+        self.stats_label.setWordWrap(True)
+        self.stats_label.setStyleSheet("font-size: 13px; padding: 8px;")
+        layout.addWidget(self.stats_label)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """将秒数格式化为 xh ym zs 形式。"""
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        parts = []
+        if h > 0:
+            parts.append(f"{h}小时")
+        if m > 0 or h > 0:
+            parts.append(f"{m}分")
+        parts.append(f"{s}秒")
+        return "".join(parts)
+
+    def load_data(self, annotations: Dict[str, dict]):
+        self.figure.clear()
+
+        # 收集有耗时记录的数据
+        times = []
+        for ann in annotations.values():
+            t = ann.get("time_spent", 0.0)
+            if t > 0:
+                times.append(t)
+
+        if not times:
+            ax = self.figure.add_subplot(111)
+            ax.text(0.5, 0.5, "暂无耗时数据", ha="center", va="center",
+                    fontsize=14, color="#999")
+            ax.set_axis_off()
+            self.figure.tight_layout()
+            self.canvas.draw()
+            self.stats_label.setText("暂无耗时数据（需要在 PoseEditor 中标注后产生）")
+            return
+
+        times_arr = np.array(times)
+        total = float(np.sum(times_arr))
+        mean_v = float(np.mean(times_arr))
+        median_v = float(np.median(times_arr))
+
+        # 左图：耗时分布直方图
+        ax1 = self.figure.add_subplot(121)
+        ax1.hist(times_arr, bins=min(30, max(10, len(times) // 5)),
+                 color="#4a90d9", edgecolor="white", alpha=0.85)
+        ax1.axvline(mean_v, color="red", linestyle="--",
+                    label=f"均值={mean_v:.1f}s")
+        ax1.axvline(median_v, color="orange", linestyle="--",
+                    label=f"中位数={median_v:.1f}s")
+        ax1.legend(fontsize=8)
+        ax1.set_title("每张图耗时分布", fontsize=11)
+        ax1.set_xlabel("耗时 (秒)")
+        ax1.set_ylabel("图片数量")
+
+        # 右图：耗时区间占比饼图
+        ax2 = self.figure.add_subplot(122)
+        # 按区间分组
+        bins_def = [(0, 30, "<30s"), (30, 60, "30s-1m"), (60, 120, "1-2m"),
+                    (120, 300, "2-5m"), (300, float("inf"), ">5m")]
+        counts = []
+        labels = []
+        for lo, hi, label in bins_def:
+            c = int(np.sum((times_arr >= lo) & (times_arr < hi)))
+            if c > 0:
+                counts.append(c)
+                labels.append(f"{label}\n({c}张)")
+        ax2.pie(counts, labels=labels, autopct="%1.0f%%",
+                colors=["#4a90d9", "#5ba0e9", "#7cb8f0", "#a0d0f8", "#c8e4fc"])
+        ax2.set_title("耗时区间分布", fontsize=11)
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+        # 统计文本
+        self.stats_label.setText(
+            f"总耗时: {self._format_duration(total)}  |  "
+            f"已记录: {len(times)}/{len(annotations)} 张  |  "
+            f"平均: {mean_v:.1f}秒  |  "
+            f"中位数: {median_v:.1f}秒  |  "
+            f"最快: {min(times):.1f}秒  |  "
+            f"最慢: {max(times):.1f}秒"
+        )
+
+
 # ── 主窗口 ──────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -712,10 +807,12 @@ class MainWindow(QMainWindow):
         self.tab_dist = ScoreDistributionTab()
         self.tab_matrix = ScoreMatrixTab()
         self.tab_correction = CorrectionCheckTab()
+        self.tab_time = TimeStatisticsTab()
         self.tabs.addTab(self.tab_skip, "1. 跳过原因分类")
         self.tabs.addTab(self.tab_dist, "2. 分数分布")
         self.tabs.addTab(self.tab_matrix, "3. 评分图像矩阵")
         self.tabs.addTab(self.tab_correction, "4. 修正抽查")
+        self.tabs.addTab(self.tab_time, "5. 耗时统计")
         main_layout.addWidget(self.tabs)
 
         self.statusBar().showMessage("请打开一个项目文件夹")
@@ -726,6 +823,7 @@ class MainWindow(QMainWindow):
         self.tab_dist.load_data(annotations)
         self.tab_matrix.load_data(annotations, image_paths)
         self.tab_correction.load_data(annotations, image_paths)
+        self.tab_time.load_data(annotations)
 
     def _open_project(self):
         dir_path = QFileDialog.getExistingDirectory(self, "选择项目文件夹")
