@@ -3,6 +3,9 @@
 import json
 import random
 import sys
+import tarfile
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -100,6 +103,96 @@ def load_project(project_dir: Path) -> Tuple[Dict[str, dict], Dict[str, Path]]:
         for f in img_dir.iterdir():
             if f.suffix.lower() in IMAGE_EXTENSIONS:
                 image_paths[f.stem] = f
+
+    # 加载所有标注
+    for jf in sorted(json_dir.glob("*.json")):
+        try:
+            data = json.loads(jf.read_text("utf-8"))
+            if isinstance(data, list) and data:
+                data = data[0]
+            annotations[jf.stem] = data
+        except Exception:
+            continue
+
+    return annotations, image_paths
+
+
+_IGNORE_DIRS = {"inpainting"}
+
+
+def _extract_images_from_archive(archive_path: Path, dest_dir: Path):
+    """从压缩包（zip/tar）中提取图像文件，忽略inpainting目录和非图像文件。"""
+    suffix = archive_path.suffix.lower()
+    if suffix == ".zip":
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                parts = Path(info.filename).parts
+                if _IGNORE_DIRS & {p.lower() for p in parts}:
+                    continue
+                name = Path(info.filename).name
+                if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                    dest = dest_dir / name
+                    dest.write_bytes(zf.read(info.filename))
+    elif suffix in (".tar", ".gz", ".tgz", ".bz2", ".xz"):
+        with tarfile.open(archive_path, "r:*") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                parts = Path(member.name).parts
+                if _IGNORE_DIRS & {p.lower() for p in parts}:
+                    continue
+                name = Path(member.name).name
+                if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                    data = tf.extractfile(member).read()
+                    dest = dest_dir / name
+                    dest.write_bytes(data)
+
+
+def _extract_jsons_from_archive(archive_path: Path, dest_dir: Path):
+    """从压缩包（zip/tar）中提取json文件。"""
+    suffix = archive_path.suffix.lower()
+    if suffix == ".zip":
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                name = Path(info.filename).name
+                if Path(name).suffix.lower() == ".json":
+                    dest = dest_dir / name
+                    dest.write_bytes(zf.read(info.filename))
+    elif suffix in (".tar", ".gz", ".tgz", ".bz2", ".xz"):
+        with tarfile.open(archive_path, "r:*") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                name = Path(member.name).name
+                if Path(name).suffix.lower() == ".json":
+                    data = tf.extractfile(member).read()
+                    dest = dest_dir / name
+                    dest.write_bytes(data)
+
+
+def load_from_archives(
+    image_archive_path: Path, annotation_archive_path: Path, tmp_dir: Path
+) -> Tuple[Dict[str, dict], Dict[str, Path]]:
+    """从两个压缩包加载：图片包中提取图像（忽略json），标注包中提取json。"""
+    annotations = {}
+    image_paths = {}
+
+    img_dir = tmp_dir / "images"
+    json_dir = tmp_dir / "annotations"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    json_dir.mkdir(parents=True, exist_ok=True)
+
+    _extract_images_from_archive(image_archive_path, img_dir)
+    _extract_jsons_from_archive(annotation_archive_path, json_dir)
+
+    # 建立图像路径索引
+    for f in img_dir.iterdir():
+        if f.suffix.lower() in IMAGE_EXTENSIONS:
+            image_paths[f.stem] = f
 
     # 加载所有标注
     for jf in sorted(json_dir.glob("*.json")):
@@ -593,6 +686,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("标注质量检查工具")
         self.resize(1300, 900)
+        self._tmp_dir = None  # 保持临时目录引用，防止被回收
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -602,9 +696,13 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         self.path_label = QLabel("未选择项目")
         top.addWidget(self.path_label)
-        open_btn = QPushButton("打开项目文件夹")
-        open_btn.clicked.connect(self._open_project)
-        top.addWidget(open_btn)
+        self.open_folder_btn = QPushButton("打开项目文件夹")
+        self.open_folder_btn.clicked.connect(self._open_project)
+        top.addWidget(self.open_folder_btn)
+        self.open_archive_btn = QPushButton("从压缩包导入")
+        self.open_archive_btn.setToolTip("选择图片压缩包(tar/zip) + 标注压缩包(zip)，快速加载检查")
+        self.open_archive_btn.clicked.connect(self._open_from_archives)
+        top.addWidget(self.open_archive_btn)
         top.addStretch()
         main_layout.addLayout(top)
 
@@ -622,6 +720,13 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("请打开一个项目文件夹")
 
+    def _load_into_tabs(self, annotations, image_paths):
+        """加载数据到所有标签页。"""
+        self.tab_skip.load_data(annotations, image_paths)
+        self.tab_dist.load_data(annotations)
+        self.tab_matrix.load_data(annotations, image_paths)
+        self.tab_correction.load_data(annotations, image_paths)
+
     def _open_project(self):
         dir_path = QFileDialog.getExistingDirectory(self, "选择项目文件夹")
         if not dir_path:
@@ -635,11 +740,49 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"已加载 {len(annotations)} 个标注, {len(image_paths)} 张图像"
         )
+        self._load_into_tabs(annotations, image_paths)
 
-        self.tab_skip.load_data(annotations, image_paths)
-        self.tab_dist.load_data(annotations)
-        self.tab_matrix.load_data(annotations, image_paths)
-        self.tab_correction.load_data(annotations, image_paths)
+        # 锁定另一个按钮
+        self.open_archive_btn.setEnabled(False)
+        self.open_folder_btn.setEnabled(False)
+
+    def _open_from_archives(self):
+        archive_filter = "压缩包 (*.tar *.tar.gz *.tgz *.zip)"
+        image_archive, _ = QFileDialog.getOpenFileName(
+            self, "选择图片压缩包", "", archive_filter
+        )
+        if not image_archive:
+            return
+
+        annotation_archive, _ = QFileDialog.getOpenFileName(
+            self, "选择标注压缩包（从PoseEditor导出）", "", "ZIP 文件 (*.zip)"
+        )
+        if not annotation_archive:
+            return
+
+        self.path_label.setText(
+            f"图片: {Path(image_archive).name}  |  标注: {Path(annotation_archive).name}"
+        )
+        self.statusBar().showMessage("正在解压并加载...")
+        QApplication.processEvents()
+
+        try:
+            self._tmp_dir = tempfile.TemporaryDirectory()
+            tmp_path = Path(self._tmp_dir.name)
+
+            annotations, image_paths = load_from_archives(
+                Path(image_archive), Path(annotation_archive), tmp_path
+            )
+            self.statusBar().showMessage(
+                f"已加载 {len(annotations)} 个标注, {len(image_paths)} 张图像"
+            )
+            self._load_into_tabs(annotations, image_paths)
+
+            # 锁定另一个按钮
+            self.open_folder_btn.setEnabled(False)
+            self.open_archive_btn.setEnabled(False)
+        except Exception as e:
+            self.statusBar().showMessage(f"加载失败: {e}")
 
 
 def main():
